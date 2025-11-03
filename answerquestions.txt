@@ -1,0 +1,105 @@
+1. 📏 Che giấu độ dài mật khẩu
+
+Phương pháp của chúng ta (sử dụng AES-GCM) hiện tại không che giấu hoàn toàn độ dài mật khẩu, vì AES-GCM là một mật mã luồng và độ dài bản mã gần bằng độ dài bản rõ.
+
+Để ngăn chặn việc rò rỉ thông tin về độ dài, phương pháp đúng là sử dụng padding (độn):
+
+    Chúng ta sẽ xác định một độ dài tối đa cố định cho mật khẩu (ví dụ: 256 byte).
+
+    Trước khi mã hóa, mọi mật khẩu (ngắn hay dài) đều sẽ được đệm thêm các byte rác (hoặc byte 0) cho đến khi chúng đạt đúng độ dài 256 byte.
+
+    Kết quả là, cả mật khẩu "123" và "P@sswordR@tDai&anToan123!" đều tạo ra bản mã (ciphertext) có cùng độ dài. Kẻ tấn công nhìn vào file dữ liệu sẽ không thể phân biệt được mật khẩu nào dài hay ngắn.
+
+2. 🔁 Ngăn chặn Swap Attack (Tấn công Tráo đổi)
+
+    Phương pháp: Chúng ta sử dụng tính năng Dữ liệu Xác thực Bổ sung (AAD - Additional Authenticated Data) của thuật toán AES-GCM.
+
+    Cách thức hoạt động:
+
+        Trong hàm init, chúng ta tạo một keychainID ngẫu nhiên, duy nhất cho mỗi keychain.
+
+        Khi mã hóa một mục (hàm set), chúng ta đặt AAD = this.data.keychainID + name (tên miền).
+
+    Tại sao nó bị ngăn chặn: Thuật toán AES-GCM "ràng buộc" về mặt mật mã bản mã (ciphertext) với AAD. Thẻ xác thực (authentication tag) được tạo ra phụ thuộc vào cả MEK (Khóa chủ), IV, ciphertext và AAD.
+
+    Nếu kẻ tấn công sao chép một mục đã mã hóa từ Keychain A (có keychainID_A) sang Keychain B (có keychainID_B), khi người dùng cố gắng get mục đó trên Keychain B, hệ thống sẽ:
+
+        Lấy bản mã (ciphertext) bị đánh cắp.
+
+        Tạo AAD mới bằng keychainID_B + name.
+
+        Hàm subtle.decrypt sẽ thất bại. Lý do là vì thẻ xác thực được lưu trong bản mã được tính toán bằng keychainID_A, nhưng hàm giải mã đang kiểm tra nó với keychainID_B. Sự không khớp này khiến việc giải mã bị hủy bỏ, ngăn chặn thành công cuộc tấn công.
+
+3. Trusted Storage (Lưu trữ Tin cậy) cho Rollback Attack
+
+Vâng, việc giả định có một vị trí lưu trữ tin cậy là bắt buộc.
+
+    Giải thích: Một cuộc tấn công rollback (quay lui) về cơ bản là hành động kẻ tấn công thay thế toàn bộ tệp dữ liệu (repr) bằng một phiên bản cũ hơn (mà chúng đã sao lưu trước đó). Kẻ tấn công kiểm soát toàn bộ tệp này.
+
+    Nếu cơ chế bảo vệ (checksum) được lưu bên trong chính tệp repr, nó cũng sẽ bị "quay lui" cùng với phần còn lại của tệp. Kẻ tấn công chỉ cần thay thế tệp hiện tại bằng tệp cũ (vốn có checksum cũ hợp lệ), và hệ thống sẽ không phát hiện được.
+
+    Do đó, để phát hiện sự thay thế này, checksum (hoặc hash) của phiên bản hiện tại phải được lưu ở một nơi bên ngoài tệp dữ liệu và nằm ngoài tầm kiểm soát của kẻ tấn công (ví dụ: một file riêng biệt có quyền "chỉ ghi", một dịch vụ máy chủ tin cậy, hoặc một thuộc tính mở rộng (extended attribute) của hệ thống tệp).
+
+4. 🎲 Randomized MACs (MAC Ngẫu nhiên)
+
+    Vấn đề: Trong thiết kế của chúng ta, chúng ta dùng _hash(name) (một hàm băm tất định) làm khóa (key) trong đối tượng KVS. Điều này cho phép tra cứu O(1) (thời gian không đổi). Nếu chúng ta sử dụng MAC ngẫu nhiên, mỗi lần gọi mac(name) sẽ ra một kết quả khác nhau, chúng ta không thể dùng nó làm khóa để tra cứu.
+
+    Giải pháp (Cách tra cứu): Chúng ta không thể dùng KVS (Key-Value Store) dạng object (hash map) nữa. Thay vào đó, chúng ta phải lưu trữ dữ liệu dưới dạng một mảng (array) các đối tượng. Để tra cứu get("google.com"), chúng ta phải:
+
+        Lặp (iterate) qua toàn bộ mảng.
+
+        Với từng mục, chúng ta giải mã tên miền đã được mã hóa của mục đó.
+
+        So sánh tên miền vừa giải mã với "google.com".
+
+        Nếu khớp, trả về mật khẩu đã giải mã của mục đó.
+
+    Chi phí hiệu năng (Performance Penalty): Có, chi phí hiệu năng cực kỳ lớn.
+
+        Tra cứu: Thao tác tra cứu chuyển từ O(1) (rất nhanh) sang O(n) (chậm, n là tổng số mật khẩu).
+
+        Giải mã: Thay vì chỉ 1 thao tác giải mã (mật khẩu), giờ đây chúng ta cần trung bình n/2 thao tác giải mã (tên miền) chỉ để tìm đúng mục.
+
+5. 🤫 Che giấu Số lượng Bản ghi (k)
+
+    Vấn đề: Hiện tại, file dump của chúng ta là một JSON của kvs. Kẻ tấn công có thể đếm chính xác số lượng khóa (key) và biết chính xác k.
+
+    Mục tiêu: Chỉ tiết lộ ⌊log2​(k)⌋ (tức là chỉ tiết lộ "bậc" hay "số bit" của k).
+
+    Phương pháp: Độn KVS bằng các mục giả (Dummy Padding).
+
+        Khi dump, chúng ta đếm số lượng mục thật k.
+
+        Chúng ta tìm lũy thừa của 2 tiếp theo lớn hơn hoặc bằng k. Gọi số đó là N=2⌈log2​(k)⌉. (Ví dụ: nếu k=10, N=16. Nếu k=17, N=32).
+
+        Chúng ta tạo N−k mục giả. Mỗi mục giả là một cặp (key, value) ngẫu nhiên (ví dụ: key là hash của một số ngẫu nhiên, value là một chuỗi ngẫu nhiên đã được mã hóa).
+
+        Chúng ta thêm các mục giả này vào KVS trước khi JSON.stringify.
+
+    Kẻ tấn công nhìn vào file dump sẽ luôn thấy tổng số mục là một lũy thừa của 2 (ví dụ: 16, 32, 64...). Nếu họ thấy 32 mục, họ chỉ biết số mục thật k nằm trong khoảng (16,32], tức là ⌊log2​(k)⌋=4. Điều này che giấu k chính xác.
+
+6. 🤝 Hỗ trợ Đa người dùng (Multi-User)
+
+    Vấn đề: Hiện tại, toàn bộ keychain được mã hóa bằng một MEK (Khóa chủ) duy nhất, bắt nguồn từ một mật khẩu chủ duy nhất.
+
+    Phương pháp: Chúng ta cần một hệ thống phân cấp khóa (key hierarchy) hoặc mã hóa lai (hybrid encryption).
+
+    Cách thức hoạt động:
+
+        Thay vì MEK mã hóa trực tiếp các mật khẩu, mỗi một mục (ví dụ nytimes) sẽ được mã hóa bằng một Khóa Mã hóa Mục (IEK - Item Encryption Key) ngẫu nhiên, duy nhất (ví dụ IEK_nyt).
+
+        Mật khẩu nytimes được mã hóa bằng IEK_nyt.
+
+        Khóa IEK_nyt này sau đó sẽ được mã hóa nhiều lần bởi Khóa chủ (MEK) của mỗi người dùng được phép truy cập:
+
+            IEK_nyt được mã hóa bằng MEK_Alice -> lưu lại Encrypted_IEK_A.
+
+            IEK_nyt được mã hóa bằng MEK_Bob -> lưu lại Encrypted_IEK_B.
+
+        Mục nytimes trong KVS sẽ được lưu dưới dạng: { ct: (mật khẩu đã mã hóa), keys: { alice_id: Encrypted_IEK_A, bob_id: Encrypted_IEK_B } }
+
+        Khi Alice truy cập: Cô ấy dùng MEK_Alice để giải mã Encrypted_IEK_A → lấy được IEK_nyt. Sau đó, cô ấy dùng IEK_nyt để giải mã mật khẩu nytimes.
+
+        Khi Bob truy cập: Anh ấy làm tương tự với MEK_Bob.
+
+        Bảo mật: Đối với mật khẩu google.com cá nhân của Alice, mục keys sẽ chỉ chứa { alice_id: Encrypted_IEK_Google }. Bob không thể giải mã được IEK_Google và do đó không thể đọc được mật khẩu.
